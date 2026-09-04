@@ -1,6 +1,6 @@
 # Theme Come True
 
-An Omarchy menu bar plugin for switching light/dark mode and the theme and/or wallpaper.
+An Omarchy menu bar plugin for switching light/dark mode and the theme and/or wallpaper. Created and code reviewed by GPT 6 Astra Ultra.
 
 ![Theme Come True with Solitude – On Pole](preview.png)
 
