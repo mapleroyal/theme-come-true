@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Adapt one theme-set palette commit to Omarchy's native wallpaper reveal.
+
+Only the theme child receives this directory on PATH. Every other IPC call is
+executed by Omarchy's real client, and theme-set retains its normal app hooks.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+import time
+from typing import Any
+
+sys.dont_write_bytecode = True
+
+# omarchy-theme-set wraps this entire process in `timeout 2`. Preparation is
+# optional and must leave most of that window for the real visual transition.
+INVENTORY_TIMEOUT = 0.35
+PREPARATION_TIMEOUT = 0.2
+NATIVE_TIMEOUT = 0.9
+
+
+def native_client() -> Path:
+    return (Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")) / "bin/omarchy-shell").resolve()
+
+
+def passthrough(native: Path, arguments: list[str]) -> int:
+    try:
+        os.execv(str(native), [str(native), *arguments])
+    except OSError as error:
+        print(f"appearance IPC bridge: {error}", file=sys.stderr)
+        return 127
+
+
+def private_context(path: Path, native: Path) -> dict[str, Any]:
+    directory = path.parent
+    for candidate, directory_expected in ((directory, True), (path, False)):
+        metadata = candidate.stat(follow_symlinks=False)
+        valid_type = stat.S_ISDIR(metadata.st_mode) if directory_expected else stat.S_ISREG(metadata.st_mode)
+        if not valid_type or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError("Theme transition context is not private")
+    context = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(context, dict) or context.get("version") != 1:
+        raise ValueError("Unsupported theme transition context")
+    if Path(str(context.get("nativeShell", ""))).resolve() != native:
+        raise ValueError("Theme transition context names a different native IPC client")
+    if not context.get("theme") or "background" not in context:
+        raise ValueError("Theme transition context is incomplete")
+    return context
+
+
+def atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}-{secrets.token_hex(4)}")
+    try:
+        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def run_short(
+    arguments: list[str], timeout: float, *, env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(arguments, text=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=env, start_new_session=True)
+    def interrupted(signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    previous_handler = signal.signal(signal.SIGTERM, interrupted)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        # These are short IPC/read-only helpers. Kill the owned group directly
+        # rather than spend the native caller's budget on a shutdown grace period.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+    return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+
+
+def invoke(
+    native: Path, arguments: list[str], *, timeout: float = NATIVE_TIMEOUT,
+) -> subprocess.CompletedProcess[str]:
+    return run_short([str(native), *arguments], timeout)
+
+
+def planned_status(background: Path) -> dict[str, Any]:
+    helper = Path(__file__).resolve().parent.parent / "appearance-helper"
+    environment = {**os.environ, "OMARCHY_APPEARANCE_PREPARE": "1"}
+    result = run_short([str(helper), "status", "--background-override", str(background)],
+                       INVENTORY_TIMEOUT, env=environment)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Could not prepare appearance inventory")
+    snapshot = json.loads(result.stdout)
+    if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+        raise RuntimeError("Unsupported appearance inventory")
+    return snapshot
+
+
+def replace_background(background: Path) -> None:
+    state = Path.home() / ".local/state/omarchy/current"
+    temporary = state / f".background.appearance-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        temporary.symlink_to(background)
+        os.replace(temporary, state / "background")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def transition(native: Path, context_path: Path, context: dict[str, Any], arguments: list[str]) -> int:
+    event_path = context_path.with_name("applied.json")
+    native_transition = arguments[:2] == ["background", "themeTransition"]
+    native_attempted = False
+    event: dict[str, Any] = {
+        "version": 1,
+        "ok": False,
+        "event": "transition-accepted",
+        "theme": str(context["theme"]),
+        "requestId": str(context.get("requestId", "")),
+    }
+    try:
+        state = Path.home() / ".local/state/omarchy/current"
+        if (state / "theme.name").read_text(encoding="utf-8").strip() != event["theme"]:
+            raise RuntimeError("The staged theme changed before its wallpaper transition")
+        background_value = arguments[4] if native_transition else str(context["background"])
+        if not background_value:
+            return passthrough(native, arguments)
+        background = Path(background_value).resolve(strict=True)
+        if not background.is_file() or not os.access(background, os.R_OK):
+            raise RuntimeError("The remembered wallpaper is no longer readable")
+        event["background"] = str(background)
+        try:
+            snapshot = planned_status(background)
+            event["status"] = snapshot
+            if event["requestId"]:
+                preparation = invoke(native, [
+                    "appearance", "prepareVisual", event["requestId"],
+                    json.dumps(snapshot, separators=(",", ":")),
+                ], timeout=PREPARATION_TIMEOUT)
+                event["visualPrepared"] = preparation.returncode == 0
+        except Exception as error:
+            # Inventory/preview preparation must not prevent the OS commit.
+            event["visualPrepared"] = False
+            event["preparationError"] = str(error)
+
+        previous = str(context.get("previousBackground") or "")
+        transition_arguments = arguments if native_transition else [
+            "background", "themeTransition", previous, str(background), str(background),
+            arguments[2], arguments[3],
+        ]
+        native_attempted = True
+        result = invoke(native, transition_arguments)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "The native wallpaper transition failed")
+        # The normal theme command owns its default wallpaper link. Only the
+        # skip-background branch delegates that state update to this adapter.
+        if not native_transition:
+            replace_background(background)
+        event["ok"] = True
+        event["timeNs"] = time.time_ns()
+        atomic_json(event_path, event)
+        return 0
+    except Exception as error:
+        event["error"] = str(error)
+        event["timeNs"] = time.time_ns()
+        try:
+            atomic_json(event_path, event)
+        except OSError:
+            pass
+        if native_transition and native_attempted:
+            # theme-set already follows a failed native reveal with its own
+            # palette fallback. Do not add a second reveal attempt here.
+            print(str(error), file=sys.stderr)
+            return 1
+        # The parent's fallback can restore the wallpaper after the normal
+        # app hooks. Preserve the OS's original palette commit meanwhile.
+        return passthrough(native, arguments)
+
+
+def main() -> int:
+    native = native_client()
+    arguments = sys.argv[1:]
+    context_value = os.environ.get("OMARCHY_APPEARANCE_CONTEXT", "")
+    palette_commit = len(arguments) == 4 and arguments[:2] == ["shell", "applyTheme"]
+    native_transition = len(arguments) == 7 and arguments[:2] == ["background", "themeTransition"]
+    if not (palette_commit or native_transition) or not context_value:
+        return passthrough(native, arguments)
+    context_path = Path(context_value)
+    try:
+        if not context_path.is_absolute():
+            raise ValueError("Theme transition context must be an absolute path")
+        context = private_context(context_path, native)
+        # Only theme-set's first palette commit belongs to this operation.
+        claim = context_path.with_name("claimed")
+        descriptor = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.close(descriptor)
+    except (OSError, ValueError):
+        return passthrough(native, arguments)
+    return transition(native, context_path, context, arguments)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

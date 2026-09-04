@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mapleroyal.theme-come-true",
+  "name": "Theme Come True",
+  "version": "1.0.0",
+  "author": "mapleroyal",
+  "description": "Light and dark theme pairing, visual wallpaper selection, and time or solar appearance switching.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Theme Come True",
+    "description": "Switch, cycle, or randomize light and dark themes and their wallpapers.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

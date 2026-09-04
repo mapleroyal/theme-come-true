@@ -1,0 +1,1625 @@
+#!/usr/bin/env python3
+"""Manage appearance state for the Theme Come True plugin."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+import re
+import secrets
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import quote, urlencode
+
+
+HOME = Path(os.environ.get("HOME", str(Path.home())))
+OMARCHY_PATH = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"))
+STOCK_THEMES = OMARCHY_PATH / "themes"
+USER_THEMES = HOME / ".config/omarchy/themes"
+USER_BACKGROUNDS = HOME / ".config/omarchy/backgrounds"
+CURRENT_STATE = HOME / ".local/state/omarchy/current"
+WEATHER_LOCATION = HOME / ".local/state/omarchy/settings/weather.json"
+SOLAR_CACHE = HOME / ".cache/omarchy/appearance/solar.json"
+BACKGROUND_PIN_CACHE = HOME / ".cache/omarchy/appearance/background-pins"
+BACKGROUND_PICKER_CACHE = HOME / ".cache/omarchy/appearance/picker"
+PICKER_CACHE_OWNER = "io.github.mapleroyal.theme-come-true"
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+PALETTE_ROLES = (
+    "accent",
+    "red",
+    "green",
+    "yellow",
+    "blue",
+    "magenta",
+    "cyan",
+    "foreground",
+    "background",
+)
+HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$")
+COMMAND_TIMEOUT_SECONDS = 60
+PALETTE_TIMEOUT_SECONDS = 5
+MUTATION_DEADLINE: float | None = None
+
+
+class AppearanceError(RuntimeError):
+    pass
+
+
+class CommandInterrupted(AppearanceError):
+    pass
+
+
+def run_bounded(
+    arguments: list[str], *, timeout: float = COMMAND_TIMEOUT_SECONDS,
+    env: dict[str, str] | None = None,
+    on_poll: Callable[[], None] | None = None,
+    own_process_group: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Wait for the command, leaving its intentional background cleanup alone."""
+    if MUTATION_DEADLINE is not None:
+        timeout = min(timeout, max(0, MUTATION_DEADLINE - time.monotonic()))
+    if timeout <= 0:
+        raise AppearanceError("The appearance operation timed out")
+    # Native theme-set starts a delayed snapshot cleanup that inherits its
+    # output descriptors. Pipe EOF would hold completion for that cleanup's
+    # three-second sleep, although all foreground application hooks finished.
+    # Files capture output without making descendant EOF part of completion.
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout_file, \
+         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file:
+        try:
+            process = subprocess.Popen(
+                arguments, text=True, stdout=stdout_file, stderr=stderr_file,
+                env=env, start_new_session=own_process_group,
+            )
+        except OSError as error:
+            raise AppearanceError(f"Could not run {Path(arguments[0]).name}: {error}") from error
+
+        def stop_children() -> None:
+            def send_signal(signum: int) -> None:
+                try:
+                    if own_process_group:
+                        os.killpg(process.pid, signum)
+                    else:
+                        # The preparation bridge owns the encompassing group.
+                        process.send_signal(signum)
+                except ProcessLookupError:
+                    pass
+
+            send_signal(signal.SIGTERM)
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            # Even if the leader exited promptly, a child can ignore SIGTERM.
+            send_signal(signal.SIGKILL)
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+        def interrupted(_signum: int, _frame: Any) -> None:
+            raise CommandInterrupted(f"{Path(arguments[0]).name} was interrupted")
+
+        previous_handler = signal.signal(signal.SIGTERM, interrupted)
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(arguments, timeout)
+                try:
+                    process.wait(timeout=min(0.05, remaining) if on_poll else remaining)
+                    if on_poll is not None:
+                        on_poll()
+                    break
+                except subprocess.TimeoutExpired:
+                    if on_poll is not None and time.monotonic() < deadline:
+                        on_poll()
+                        continue
+                    raise
+        except subprocess.TimeoutExpired as error:
+            stop_children()
+            raise AppearanceError(
+                f"{Path(arguments[0]).name} timed out after {timeout:g} seconds"
+            ) from error
+        except BaseException:
+            stop_children()
+            raise
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        return subprocess.CompletedProcess(
+            arguments, process.returncode, stdout_file.read(), stderr_file.read()
+        )
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except OSError:
+        # A cache failure must not disable an otherwise valid solar schedule.
+        pass
+
+
+def http_json(url: str, timeout: int = 8) -> dict[str, Any]:
+    result = subprocess.run(
+        ["curl", "-fsS", "--max-time", str(timeout), url],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "Location service is unavailable"
+        raise AppearanceError(detail)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise AppearanceError("Location service returned invalid data") from error
+    if not isinstance(data, dict):
+        raise AppearanceError("Location service returned invalid data")
+    return data
+
+
+def finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def valid_coordinates(latitude: Any, longitude: Any) -> tuple[float, float] | None:
+    lat = finite_number(latitude)
+    lon = finite_number(longitude)
+    if lat is None or lon is None or not -90 <= lat <= 90 or not -180 <= lon <= 180:
+        return None
+    return lat, lon
+
+
+def weather_location_settings() -> dict[str, Any]:
+    data = read_json(WEATHER_LOCATION)
+    coordinates = valid_coordinates(data.get("latitude"), data.get("longitude"))
+    return {
+        "name": str(data.get("name") or "").strip(),
+        "latitude": coordinates[0] if coordinates else None,
+        "longitude": coordinates[1] if coordinates else None,
+    }
+
+
+def weather_fingerprint(settings: dict[str, Any]) -> str:
+    return json.dumps(settings, sort_keys=True, separators=(",", ":"))
+
+
+def nested_value(container: dict[str, Any], key: str) -> str:
+    values = container.get(key)
+    if not isinstance(values, list) or not values or not isinstance(values[0], dict):
+        return ""
+    return str(values[0].get("value") or "").strip()
+
+
+def detect_location(settings: dict[str, Any]) -> dict[str, Any]:
+    coordinates = valid_coordinates(settings.get("latitude"), settings.get("longitude"))
+    if coordinates:
+        return {
+            "name": settings.get("name") or "Weather location",
+            "latitude": coordinates[0],
+            "longitude": coordinates[1],
+            "source": "weather",
+        }
+
+    configured_name = str(settings.get("name") or "").strip()
+    location_path = quote(configured_name, safe="") if configured_name else ""
+    report = http_json(f"https://wttr.in/{location_path}?format=j1")
+    areas = report.get("nearest_area")
+    if not isinstance(areas, list) or not areas or not isinstance(areas[0], dict):
+        raise AppearanceError("Could not determine a location for sunrise and sunset")
+
+    area = areas[0]
+    coordinates = valid_coordinates(area.get("latitude"), area.get("longitude"))
+    if not coordinates:
+        raise AppearanceError("The detected location has invalid coordinates")
+
+    city = nested_value(area, "areaName") or configured_name or "Detected location"
+    region = nested_value(area, "region")
+    label = city if not region or region.lower() == city.lower() else f"{city}, {region}"
+    return {
+        "name": label,
+        "latitude": coordinates[0],
+        "longitude": coordinates[1],
+        "source": "weather-name" if configured_name else "ip",
+    }
+
+
+def normalize_solar_payload(
+    report: dict[str, Any],
+    location: dict[str, Any],
+    fingerprint: str,
+    fetched_at: int,
+) -> dict[str, Any]:
+    daily = report.get("daily")
+    if not isinstance(daily, dict):
+        raise AppearanceError("Sunrise and sunset data is unavailable")
+
+    dates = daily.get("time") if isinstance(daily.get("time"), list) else []
+    sunrises = daily.get("sunrise") if isinstance(daily.get("sunrise"), list) else []
+    sunsets = daily.get("sunset") if isinstance(daily.get("sunset"), list) else []
+    count = max(len(dates), len(sunrises), len(sunsets))
+    events: list[dict[str, Any]] = []
+    for index in range(count):
+        date_epoch = int(dates[index]) if index < len(dates) and finite_number(dates[index]) is not None else 0
+        sunrise = int(sunrises[index]) if index < len(sunrises) and finite_number(sunrises[index]) is not None else 0
+        sunset = int(sunsets[index]) if index < len(sunsets) and finite_number(sunsets[index]) is not None else 0
+        if sunrise > 0:
+            events.append({"event": "sunrise", "mode": "light", "epoch": sunrise, "day": date_epoch})
+        if sunset > 0:
+            events.append({"event": "sunset", "mode": "dark", "epoch": sunset, "day": date_epoch})
+
+    events.sort(key=lambda event: int(event["epoch"]))
+    if not events:
+        raise AppearanceError("No sunrise or sunset occurs at this location during the forecast window")
+
+    # past_days=1 means index 1 is today in the resolved location.
+    today_sunrise = int(sunrises[1]) if len(sunrises) > 1 and finite_number(sunrises[1]) is not None else 0
+    today_sunset = int(sunsets[1]) if len(sunsets) > 1 and finite_number(sunsets[1]) is not None else 0
+    return {
+        "version": 1,
+        "fetchedAt": fetched_at,
+        "weatherFingerprint": fingerprint,
+        "location": location,
+        "timezone": str(report.get("timezone") or ""),
+        "today": {"sunrise": today_sunrise, "sunset": today_sunset},
+        "events": events,
+    }
+
+
+def cached_solar_schedule(
+    cache: dict[str, Any], fingerprint: str, now_epoch: int, *, fresh_only: bool
+) -> dict[str, Any] | None:
+    if cache.get("version") != 1 or cache.get("weatherFingerprint") != fingerprint:
+        return None
+    events = cache.get("events")
+    if not isinstance(events, list):
+        return None
+    has_future_event = any(
+        isinstance(event, dict) and finite_number(event.get("epoch")) is not None
+        and float(event["epoch"]) > now_epoch
+        for event in events
+    )
+    if not has_future_event:
+        return None
+    fetched_at = int(finite_number(cache.get("fetchedAt")) or 0)
+    if fresh_only and now_epoch - fetched_at > 6 * 60 * 60:
+        return None
+    payload = dict(cache)
+    payload["cached"] = True
+    return payload
+
+
+def solar_schedule(force_refresh: bool = False) -> dict[str, Any]:
+    now_epoch = int(time.time())
+    settings = weather_location_settings()
+    fingerprint = weather_fingerprint(settings)
+    cache = read_json(SOLAR_CACHE)
+
+    if not force_refresh:
+        cached = cached_solar_schedule(cache, fingerprint, now_epoch, fresh_only=True)
+        if cached:
+            return cached
+
+    try:
+        location = detect_location(settings)
+        query = urlencode(
+            {
+                "latitude": location["latitude"],
+                "longitude": location["longitude"],
+                "daily": "sunrise,sunset",
+                "past_days": 1,
+                "forecast_days": 7,
+                "timezone": "auto",
+                "timeformat": "unixtime",
+            }
+        )
+        report = http_json(f"https://api.open-meteo.com/v1/forecast?{query}")
+        payload = normalize_solar_payload(report, location, fingerprint, now_epoch)
+        payload["cached"] = False
+        write_json_atomic(SOLAR_CACHE, payload)
+        return payload
+    except AppearanceError:
+        cached = cached_solar_schedule(cache, fingerprint, now_epoch, fresh_only=False)
+        if cached:
+            cached["stale"] = True
+            return cached
+        raise
+
+
+def display_name(slug: str) -> str:
+    return re.sub(r"[-_]+", " ", slug).title()
+
+
+def wallpaper_name(path: str) -> str:
+    stem = Path(path).stem
+    stem = re.sub(r"^\d+-", "", stem)
+    return re.sub(r"[-_]+", " ", stem).strip().title()
+
+
+def theme_slugs() -> list[str]:
+    slugs: set[str] = set()
+    for root in (STOCK_THEMES, USER_THEMES):
+        if not root.is_dir():
+            continue
+        for entry in root.iterdir():
+            try:
+                if entry.is_dir():
+                    slugs.add(entry.name)
+            except OSError:
+                continue
+    return sorted(slugs, key=lambda value: value.encode("utf-8", "surrogateescape"))
+
+
+def repo_managed_theme(slug: str) -> bool:
+    """Match theme-set: a symlink to the user's checkout is user-managed."""
+    source = USER_THEMES / slug
+    return not source.is_symlink() and (source / ".git").is_dir()
+
+
+def effective_file(slug: str, name: str) -> Path | None:
+    user_file = USER_THEMES / slug / name
+    stock_file = STOCK_THEMES / slug / name
+    restricted = repo_managed_theme(slug)
+    user_components = [USER_THEMES / slug / Path(*Path(name).parts[:index])
+                       for index in range(1, len(Path(name).parts) + 1)]
+    if user_file.is_file() and not (restricted and any(path.is_symlink() for path in user_components)):
+        return user_file
+    if stock_file.is_file():
+        return stock_file
+    return None
+
+
+def legacy_palette(path: Path) -> dict[str, Any]:
+    """Read the legacy palette that theme-set converts in its staging area."""
+    try:
+        with path.open("rb") as handle:
+            colors = tomllib.load(handle).get("colors", {})
+        normal = colors.get("normal", {})
+        primary = colors.get("primary", {})
+        bright = colors.get("bright", {})
+        selection = colors.get("selection", {})
+        if not all(isinstance(value, dict) for value in (normal, primary, bright, selection)):
+            return {}
+
+        def color(value: Any) -> str:
+            if not isinstance(value, str):
+                return ""
+            match = re.fullmatch(r"(?:#|0[xX])?([0-9a-fA-F]{6})", value)
+            return "#" + match[1].lower() if match else ""
+
+        names = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
+        values = [color(normal.get(name)) for name in names]
+        if not all(values):
+            return {}
+        palette: dict[str, Any] = {f"color{index}": value for index, value in enumerate(values)}
+        for index, name in enumerate(names):
+            palette[f"color{index + 8}"] = color(bright.get(name)) or values[index]
+        palette["background"] = color(primary.get("background")) or values[0]
+        palette["foreground"] = color(primary.get("foreground")) or values[7]
+        palette["color0"] = palette["background"]
+        palette["color7"] = palette["foreground"]
+        palette["accent"] = values[4]
+        palette["selection"] = color(selection.get("background")) or palette["foreground"]
+        return palette
+    except (OSError, AttributeError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def read_palette(slug: str) -> tuple[dict[str, Any], bool]:
+    path = effective_file(slug, "colors.toml")
+    if path is None:
+        legacy = effective_file(slug, "alacritty.toml")
+        palette = legacy_palette(legacy) if legacy is not None else {}
+        return palette, bool(palette)
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+        return data, bool(data)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}, False
+
+
+def theme_mode(slug: str) -> tuple[str, bool]:
+    palette, valid = read_palette(slug)
+    declared = palette.get("mode") or palette.get("theme_type", "")
+    if str(declared).strip():
+        return ("light" if str(declared).strip().lower() == "light" else "dark"), valid
+
+    if effective_file(slug, "light.mode") is not None:
+        return "light", valid
+
+    background = palette.get("background") or palette.get("bg") or palette.get("color0", "")
+    if isinstance(background, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", background):
+        red = int(background[1:3], 16)
+        green = int(background[3:5], 16)
+        blue = int(background[5:7], 16)
+        return ("light" if red + green + blue > 382 else "dark"), valid
+
+    return "dark", valid
+
+
+def image_entries(directory: Path, *, reject_symlinks: bool = False) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    entries: list[Path] = []
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        return []
+    for entry in children:
+        if entry.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        if reject_symlinks and entry.is_symlink():
+            continue
+        try:
+            if entry.is_file():
+                entries.append(entry)
+        except OSError:
+            continue
+    return sorted(entries, key=lambda path: path.name.encode("utf-8", "surrogateescape"))
+
+
+def wallpaper_record(slug: str, entry: Path, origin: str) -> dict[str, Any] | None:
+    try:
+        resolved = entry.resolve(strict=True)
+    except OSError:
+        return None
+    return {
+        "id": f"{slug}:{origin}:{entry.name}",
+        "theme": slug,
+        "origin": origin,
+        "name": wallpaper_name(entry.name),
+        "filename": entry.name,
+        "path": str(resolved),
+        "stagedFilenames": [entry.name] if origin.startswith("theme-") else [],
+    }
+
+
+def effective_theme_wallpapers(slug: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+
+    # User-added backgrounds are a separate source in Omarchy and sort before
+    # the theme's own staged backgrounds.
+    for entry in image_entries(USER_BACKGROUNDS / slug):
+        record = wallpaper_record(slug, entry, "user-background")
+        if record:
+            records.append(record)
+
+    # Theme-set copies stock first and overlays user files by basename.
+    merged: dict[str, tuple[Path, str]] = {}
+    for entry in image_entries(STOCK_THEMES / slug / "backgrounds"):
+        merged[entry.name] = (entry, "theme-stock")
+
+    user_theme = USER_THEMES / slug
+    git_managed = repo_managed_theme(slug)
+    user_backgrounds = user_theme / "backgrounds"
+    user_entries = [] if git_managed and user_backgrounds.is_symlink() else image_entries(
+        user_backgrounds, reject_symlinks=git_managed
+    )
+    for entry in user_entries:
+        merged[entry.name] = (entry, "theme-user")
+
+    for filename in sorted(merged, key=lambda value: value.encode("utf-8", "surrogateescape")):
+        entry, origin = merged[filename]
+        record = wallpaper_record(slug, entry, origin)
+        if record:
+            records.append(record)
+
+    # Omarchy accepts symlinked backgrounds. Compare and cycle canonical paths
+    # so a symlink does not get stuck on the first item forever.
+    unique: list[dict[str, Any]] = []
+    seen: dict[str, dict[str, Any]] = {}
+    for record in records:
+        canonical = record["path"]
+        if canonical in seen:
+            seen[canonical]["stagedFilenames"].extend(record["stagedFilenames"])
+            continue
+        seen[canonical] = record
+        unique.append(record)
+    return unique
+
+
+class ThemeInventory:
+    """One filesystem snapshot per operation; never retain it across mutations."""
+
+    def __init__(self) -> None:
+        self.slugs = theme_slugs()
+        self._modes: dict[str, tuple[str, bool]] = {}
+        self._wallpapers: dict[str, list[dict[str, Any]]] = {}
+
+    def mode(self, slug: str) -> tuple[str, bool]:
+        if slug not in self._modes:
+            self._modes[slug] = theme_mode(slug)
+        return self._modes[slug]
+
+    def wallpapers(self, slug: str) -> list[dict[str, Any]]:
+        if slug not in self._wallpapers:
+            self._wallpapers[slug] = effective_theme_wallpapers(slug)
+        return self._wallpapers[slug]
+
+    def use_active_mode(self, slug: str, mode: str) -> None:
+        if slug and mode:
+            self._modes[slug] = (mode, self.mode(slug)[1])
+
+    def mode_wallpapers(self, mode: str) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for slug in self.slugs:
+            if self.mode(slug)[0] != mode:
+                continue
+            for record in self.wallpapers(slug):
+                if record["path"] not in seen:
+                    seen.add(record["path"])
+                    records.append(record)
+        return records
+
+
+def current_theme() -> str:
+    try:
+        return (CURRENT_STATE / "theme.name").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def active_theme_appearance() -> tuple[list[dict[str, str]], str]:
+    """Resolve palette and mode from Omarchy's authoritative staged theme."""
+    colors_file = CURRENT_STATE / "theme/colors.toml"
+    resolver = OMARCHY_PATH / "bin/omarchy-theme-color"
+    if not colors_file.is_file() or not resolver.is_file():
+        return [], ""
+
+    try:
+        result = run_bounded(
+            [str(resolver), "--file", str(colors_file), "--all"],
+            timeout=PALETTE_TIMEOUT_SECONDS,
+            # Read-only visual preparation has a stricter outer IPC budget.
+            # Keep its resolver in the bridge-owned helper group so one group
+            # kill cancels every preparation descendant without a grace wait.
+            own_process_group=os.environ.get("OMARCHY_APPEARANCE_PREPARE") != "1",
+        )
+    except AppearanceError:
+        return [], ""
+    if result.returncode != 0:
+        return [], ""
+
+    resolved: dict[str, str] = {}
+    mode = ""
+    for line in result.stdout.splitlines():
+        role, separator, value = line.partition("\t")
+        value = value.strip()
+        if separator and role == "mode":
+            mode = "light" if value.lower() == "light" else "dark"
+        if separator and role in PALETTE_ROLES and HEX_COLOR.fullmatch(value):
+            resolved[role] = value
+
+    # Match the shell's legacy ANSI-only fallback, where color4/blue is the
+    # accent when a theme does not define an explicit accent role.
+    if "accent" not in resolved and resolved.get("blue"):
+        resolved["accent"] = resolved["blue"]
+
+    return [
+        {"role": role, "label": role.replace("_", " ").title(), "color": resolved[role]}
+        for role in PALETTE_ROLES
+        if role in resolved
+    ], mode
+
+
+def active_theme_palette() -> list[dict[str, str]]:
+    return active_theme_appearance()[0]
+
+
+def actual_current_background() -> Path | None:
+    try:
+        return (CURRENT_STATE / "background").resolve(strict=True)
+    except OSError:
+        return None
+
+
+def resolved_image(path: str | Path) -> Path | None:
+    try:
+        resolved = Path(path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_file() or resolved.suffix.lower() not in IMAGE_SUFFIXES:
+        return None
+    return resolved
+
+
+def inside_current_theme(path: Path) -> bool:
+    try:
+        return path.is_relative_to((CURRENT_STATE / "theme").resolve(strict=False))
+    except (OSError, ValueError):
+        return False
+
+
+def replace_background_link(target: Path) -> None:
+    """Atomically repoint state without notifying the live background renderer."""
+    CURRENT_STATE.mkdir(parents=True, exist_ok=True)
+    link = CURRENT_STATE / "background"
+    temporary = CURRENT_STATE / f".background.appearance-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        temporary.symlink_to(target)
+        os.replace(temporary, link)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def pin_staged_background() -> Path | None:
+    """Keep the old background valid while Omarchy replaces current/theme."""
+    actual = actual_current_background()
+    if actual is None:
+        raise AppearanceError("Could not resolve the current wallpaper")
+    if not inside_current_theme(actual):
+        return None
+
+    slug = current_theme()
+    pool = effective_theme_wallpapers(slug) if slug else []
+    stable = resolved_image(stable_current_background(slug, pool))
+    created_pin: Path | None = None
+
+    if stable is None or inside_current_theme(stable):
+        BACKGROUND_PIN_CACHE.mkdir(parents=True, exist_ok=True)
+        suffix = actual.suffix.lower() if actual.suffix.lower() in IMAGE_SUFFIXES else ".jpg"
+        stable = BACKGROUND_PIN_CACHE / f"background-{time.time_ns()}-{secrets.token_hex(4)}{suffix}"
+        try:
+            os.link(actual, stable)
+        except OSError:
+            shutil.copy2(actual, stable)
+        created_pin = stable
+
+    replace_background_link(stable)
+    if actual_current_background() != stable:
+        # Keep a cache pin on ambiguous failure; the authoritative symlink may
+        # still reference it even if canonicalization briefly failed.
+        raise AppearanceError("Could not preserve the current wallpaper")
+    return created_pin
+
+
+def run_omarchy(
+    arguments: list[str], env: dict[str, str] | None = None,
+    on_poll: Callable[[], None] | None = None,
+) -> None:
+    result = run_bounded(["omarchy", *arguments], env=env, on_poll=on_poll)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "Omarchy command failed"
+        raise AppearanceError(detail)
+
+
+def apply_theme(
+    theme: str, env: dict[str, str] | None = None,
+    on_poll: Callable[[], None] | None = None,
+) -> str:
+    command_error: AppearanceError | None = None
+    try:
+        run_omarchy(["theme", "set", theme], env=env, on_poll=on_poll)
+    except CommandInterrupted:
+        raise
+    except AppearanceError as error:
+        command_error = error
+    if current_theme() != theme:
+        if command_error is not None:
+            raise command_error
+        raise AppearanceError(f"Omarchy did not activate theme '{theme}'")
+    return str(command_error) if command_error is not None else ""
+
+
+def live_theme_environment(skip_background: bool) -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in (
+        "OMARCHY_THEME_SKIP_BACKGROUND",
+        "OMARCHY_THEME_HEADLESS",
+        "OMARCHY_THEME_OFFLINE",
+    ):
+        environment.pop(name, None)
+    if skip_background:
+        environment["OMARCHY_THEME_SKIP_BACKGROUND"] = "1"
+    return environment
+
+
+def apply_background(target: Path) -> str:
+    command_error: AppearanceError | None = None
+    try:
+        run_omarchy(["theme", "bg", "set", str(target)])
+    except CommandInterrupted:
+        raise
+    except AppearanceError as error:
+        command_error = error
+    if actual_current_background() != target:
+        if command_error is not None:
+            raise command_error
+        raise AppearanceError(f"Omarchy did not activate wallpaper '{target}'")
+    return str(command_error) if command_error is not None else ""
+
+
+def switch_theme(
+    theme: str, remembered_background: str = "", request_id: str = "",
+) -> dict[str, Any]:
+    """Keep native theme hooks and coordinate its shell transition in one child."""
+    if theme not in theme_slugs():
+        raise AppearanceError(f"Unknown Omarchy theme: {theme}")
+    target = resolved_image(remembered_background) if remembered_background else None
+    created_pin: Path | None = None
+    warnings: list[str] = []
+    event: dict[str, Any] = {}
+    bridge = Path(__file__).resolve().parent / "ipc-bridge"
+    native_shell = OMARCHY_PATH / "bin/omarchy-shell"
+    bridge_available = (bridge / "omarchy-shell").is_file() and native_shell.is_file()
+
+    if target is not None:
+        try:
+            created_pin = pin_staged_background()
+        except (AppearanceError, OSError) as error:
+            # Native transitions also accept an empty previous image, so a
+            # missing old wallpaper need not discard the requested new one.
+            warnings.append(f"Could not preserve the previous wallpaper: {error}")
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="theme-come-true-") as temporary:
+            context_path = Path(temporary) / "context.json"
+            event_path = Path(temporary) / "applied.json"
+            environment = live_theme_environment(target is not None)
+            if bridge_available:
+                previous = actual_current_background()
+                context = {
+                    "version": 1,
+                    "theme": theme,
+                    "background": str(target) if target is not None else "",
+                    "previousBackground": str(previous) if previous is not None else "",
+                    "nativeShell": str(native_shell),
+                    "helperPath": str(Path(__file__).resolve()),
+                    "requestId": request_id,
+                }
+                context_path.write_text(json.dumps(context), encoding="utf-8")
+                context_path.chmod(0o600)
+                environment["OMARCHY_APPEARANCE_CONTEXT"] = str(context_path)
+                environment["PATH"] = str(bridge) + os.pathsep + environment.get("PATH", os.defpath)
+
+            def observe_transition() -> None:
+                nonlocal event
+                if event:
+                    return
+                received = read_json(event_path)
+                if received.get("version") != 1 or "ok" not in received:
+                    return
+                event = received
+                if event.get("ok") is True:
+                    snapshot = event.get("status")
+                    if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+                        try:
+                            snapshot = build_status()
+                        except Exception:
+                            # A progressive UI update must not cancel native
+                            # theme hooks; the final result still reconciles.
+                            return
+                    print(json.dumps({
+                        "version": 1, "event": "applied", "requestId": request_id,
+                        "status": snapshot,
+                    }, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+            warning = apply_theme(
+                theme, env=environment,
+                on_poll=observe_transition if bridge_available else None,
+            )
+            if warning:
+                warnings.append(warning)
+            if event.get("ok") is False:
+                warnings.append(str(event.get("error") or "The coordinated wallpaper transition failed"))
+
+        restored = False
+        fallback_kind = "theme-default" if remembered_background and target is None else ""
+        if target is not None:
+            try:
+                if actual_current_background() != target or event.get("ok") is not True:
+                    warning = apply_background(target)
+                    if warning:
+                        warnings.append(warning)
+                restored = True
+            except CommandInterrupted:
+                raise
+            except AppearanceError as restore_error:
+                warnings.append(str(restore_error))
+                inventory = ThemeInventory()
+                fallback_records = inventory.wallpapers(theme) + inventory.mode_wallpapers(inventory.mode(theme)[0])
+                fallback = next((
+                    candidate for record in fallback_records
+                    if (candidate := resolved_image(record["path"])) is not None
+                ), None)
+                if fallback is not None:
+                    warning = apply_background(fallback)
+                    if warning:
+                        warnings.append(warning)
+                    fallback_kind = "available-background"
+                elif actual_current_background() is not None:
+                    fallback_kind = "previous-background"
+                else:
+                    raise AppearanceError(
+                        f"Theme changed, but no usable wallpaper is available: {restore_error}"
+                    ) from restore_error
+        selected = actual_current_background()
+        payload: dict[str, Any] = {
+            "version": 1, "theme": theme, "restored": restored,
+            "background": str(selected) if selected is not None else "",
+        }
+        if fallback_kind:
+            payload["fallback"] = fallback_kind
+        if warnings:
+            payload["warnings"] = warnings
+        return payload
+    finally:
+        if created_pin is not None and actual_current_background() != created_pin:
+            created_pin.unlink(missing_ok=True)
+
+
+def stable_current_background(
+    slug: str, pool: list[dict[str, Any]], *, actual_override: Path | None = None,
+) -> str:
+    actual = actual_override.resolve(strict=False) if actual_override is not None else actual_current_background()
+    if actual is None:
+        return ""
+
+    staged = CURRENT_STATE / "theme/backgrounds"
+    try:
+        inside_staged = actual.is_relative_to(staged.resolve(strict=False))
+    except (OSError, ValueError):
+        inside_staged = False
+
+    if inside_staged:
+        # The staged directory is deleted at the next theme change. Map its
+        # basename back to the stable user/stock source before exposing it.
+        for record in pool:
+            if actual.name in record.get("stagedFilenames", []) or (
+                record["origin"].startswith("theme-") and record["filename"] == actual.name
+            ):
+                return str(record["path"])
+    return str(actual)
+
+
+def mode_wallpapers(mode: str) -> list[dict[str, Any]]:
+    return ThemeInventory().mode_wallpapers(mode)
+
+
+def build_status(
+    inventory: ThemeInventory | None = None, *, background_override: Path | None = None,
+) -> dict[str, Any]:
+    inventory = inventory or ThemeInventory()
+    slug = current_theme()
+    palette, active_mode = active_theme_appearance()
+    mode = active_mode or (inventory.mode(slug)[0] if slug else "dark")
+    inventory.use_active_mode(slug, active_mode)
+    active_pool = inventory.wallpapers(slug) if slug else []
+    current_path = stable_current_background(slug, active_pool, actual_override=background_override)
+    all_mode = inventory.mode_wallpapers(mode)
+
+    active_paths = {record["path"] for record in active_pool}
+    mode_paths = {record["path"] for record in all_mode}
+    current_record = next((record for record in all_mode if record["path"] == current_path), None)
+
+    themes: list[dict[str, Any]] = []
+    for theme_slug in inventory.slugs:
+        resolved_mode, valid = inventory.mode(theme_slug)
+        wallpapers = inventory.wallpapers(theme_slug)
+        themes.append(
+            {
+                "slug": theme_slug,
+                "label": display_name(theme_slug),
+                "mode": resolved_mode,
+                "validPalette": valid,
+                "wallpaperCount": len(wallpapers),
+            }
+        )
+
+    return {
+        "version": 1,
+        "current": {
+            "theme": slug,
+            "themeLabel": display_name(slug) if slug else "Unknown",
+            "mode": mode,
+            "background": current_path,
+            "backgroundName": current_record["name"] if current_record else wallpaper_name(current_path),
+            "inThemePool": current_path in active_paths,
+            "inModePool": current_path in mode_paths,
+        },
+        "pools": {"theme": len(active_pool), "mode": len(all_mode)},
+        "palette": palette,
+        "themes": themes,
+    }
+
+
+def choose_wallpaper(scope: str, direction: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    inventory = ThemeInventory()
+    slug = current_theme()
+    mode = active_theme_appearance()[1] or inventory.mode(slug)[0]
+    inventory.use_active_mode(slug, mode)
+    active_pool = inventory.wallpapers(slug)
+    pool = active_pool if scope == "theme" else inventory.mode_wallpapers(mode)
+    if not pool:
+        label = "active theme" if scope == "theme" else f"{mode} themes"
+        raise AppearanceError(f"No wallpapers found for {label}")
+
+    current_path = stable_current_background(slug, active_pool)
+    current_index = next((index for index, record in enumerate(pool) if record["path"] == current_path), -1)
+    if direction == "random":
+        candidates = [record for record in pool if record["path"] != current_path]
+        chosen = secrets.choice(candidates or pool)
+    else:
+        step = -1 if direction == "previous" else 1
+        if current_index < 0:
+            next_index = len(pool) - 1 if step < 0 else 0
+        else:
+            next_index = (current_index + step) % len(pool)
+        chosen = pool[next_index]
+
+    metadata = {
+        "version": 1,
+        "scope": scope,
+        "mode": mode,
+        "count": len(pool),
+        "currentFound": current_index >= 0,
+        "next": chosen,
+    }
+    return chosen, metadata
+
+
+def cycle_wallpaper(scope: str, direction: str, dry_run: bool) -> dict[str, Any]:
+    chosen, metadata = choose_wallpaper(scope, direction)
+    if dry_run:
+        return metadata
+
+    warning = apply_background(Path(chosen["path"]))
+    metadata["applied"] = True
+    if warning:
+        metadata["warnings"] = [warning]
+    return metadata
+
+
+def set_wallpaper(path: str) -> dict[str, Any]:
+    target = validate_personal_wallpaper(path)
+    warning = apply_background(target)
+    payload: dict[str, Any] = {"version": 1, "applied": True, "background": str(target)}
+    if warning:
+        payload["warnings"] = [warning]
+    return payload
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        return path.is_relative_to(root)
+    except (OSError, ValueError):
+        return False
+
+
+def ensure_not_system_path(path: Path, purpose: str) -> Path:
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise AppearanceError(f"Could not resolve the {purpose.lower()}") from error
+    for candidate in (OMARCHY_PATH, Path("/usr/share")):
+        try:
+            system_root = candidate.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if path_is_within(resolved, system_root):
+            raise AppearanceError(f"{purpose} resolves inside a system directory")
+    return resolved
+
+
+def safe_cache_component(value: str) -> str:
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-") or "unknown"
+    digest = hashlib.sha256(value.encode("utf-8", "surrogateescape")).hexdigest()[:10]
+    return f"{readable[:48]}-{digest}"
+
+
+def safe_picker_label(value: str) -> str:
+    cleaned = "".join(
+        character if character.isprintable() and character not in "/\\" else " "
+        for character in value
+    )
+    return re.sub(r"\s+", " ", cleaned).strip(" .") or "Wallpaper"
+
+
+def truncate_utf8(value: str, maximum_bytes: int) -> str:
+    encoded = value.encode("utf-8", "surrogateescape")
+    if len(encoded) <= maximum_bytes:
+        return value
+    return encoded[:maximum_bytes].decode("utf-8", "ignore").rstrip(" .")
+
+
+def picker_stage_filename(
+    record: dict[str, Any], scope: str, index: int, count: int
+) -> str:
+    width = max(3, len(str(count)))
+    prefix = f"{index + 1:0{width}d} · "
+    if scope == "mode":
+        label = f"{display_name(str(record['theme']))} — {record['name']}"
+    else:
+        label = str(record["name"])
+    label = safe_picker_label(label)
+    suffix = Path(str(record["path"])).suffix.lower()
+    available = max(1, 240 - len((prefix + suffix).encode("utf-8")))
+    return f"{prefix}{truncate_utf8(label, available)}{suffix}"
+
+
+def target_signature(path: Path) -> dict[str, int]:
+    try:
+        metadata = path.stat()
+    except OSError as error:
+        raise AppearanceError(f"Wallpaper is no longer available: {path}") from error
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "size": metadata.st_size,
+        "mtimeNs": metadata.st_mtime_ns,
+    }
+
+
+def picker_manifest(
+    scope: str,
+    slug: str,
+    mode: str,
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        target = resolved_image(str(record["path"]))
+        if target is None:
+            raise AppearanceError(f"Wallpaper is no longer available: {record['path']}")
+        items.append(
+            {
+                "stage": picker_stage_filename(record, scope, index, len(records)),
+                "path": str(target),
+                "name": str(record["name"]),
+                "theme": str(record["theme"]),
+                "origin": str(record["origin"]),
+                "signature": target_signature(target),
+            }
+        )
+    return {
+        "version": 1,
+        "owner": PICKER_CACHE_OWNER,
+        "scope": scope,
+        # A mode pool is shared by all themes in that mode. Keeping the active
+        # slug out of its identity avoids invalidating hot native thumbnails
+        # when only the active theme changes.
+        "theme": slug if scope == "theme" else "",
+        "mode": mode,
+        "items": items,
+    }
+
+
+def remove_cache_entry(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path)
+
+
+def picker_stage_matches(stage: Path, manifest: dict[str, Any]) -> bool:
+    if stage.is_symlink() or not stage.is_dir():
+        return False
+    if read_json(stage / "manifest.json") != manifest:
+        return False
+
+    items = manifest.get("items")
+    if not isinstance(items, list):
+        return False
+    expected = {"manifest.json", *(str(item.get("stage") or "") for item in items)}
+    try:
+        if {entry.name for entry in stage.iterdir()} != expected:
+            return False
+        for item in items:
+            link = stage / str(item["stage"])
+            if not link.is_symlink():
+                return False
+            if link.resolve(strict=True) != Path(str(item["path"])):
+                return False
+            if target_signature(Path(str(item["path"]))) != item.get("signature"):
+                return False
+    except (AppearanceError, OSError, RuntimeError):
+        return False
+    return True
+
+
+def picker_stage_owned(stage: Path) -> bool:
+    return (
+        not stage.is_symlink()
+        and stage.is_dir()
+        and read_json(stage / "manifest.json").get("owner") == PICKER_CACHE_OWNER
+    )
+
+
+def picker_cache_root() -> Path:
+    ensure_not_system_path(BACKGROUND_PICKER_CACHE, "Wallpaper browser cache")
+    try:
+        BACKGROUND_PICKER_CACHE.mkdir(parents=True, exist_ok=True)
+        resolved = BACKGROUND_PICKER_CACHE.resolve(strict=True)
+    except OSError as error:
+        raise AppearanceError("Could not prepare the wallpaper browser cache") from error
+    ensure_not_system_path(resolved, "Wallpaper browser cache")
+    return resolved
+
+
+def stage_wallpaper_pool(
+    scope: str,
+    slug: str,
+    mode: str,
+    records: list[dict[str, Any]],
+) -> tuple[Path, dict[str, Any]]:
+    cache_root = picker_cache_root()
+    identity = mode if scope == "mode" else slug
+    stage = cache_root / f"{scope}-{safe_cache_component(identity)}"
+    manifest = picker_manifest(scope, slug, mode, records)
+    lock_path = cache_root / ".stage.lock"
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_fd = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise AppearanceError("Could not lock the wallpaper browser cache") from error
+
+    temporary = cache_root / f".{stage.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+    backup = cache_root / f".{stage.name}.old-{os.getpid()}-{secrets.token_hex(4)}"
+    temporary_created = False
+    try:
+        with os.fdopen(lock_fd, "r+") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            if picker_stage_matches(stage, manifest):
+                return stage, manifest
+            if stage.exists() or stage.is_symlink():
+                if not picker_stage_owned(stage):
+                    raise AppearanceError(
+                        f"Wallpaper browser cache path is not owned by this plugin: {stage}"
+                    )
+            if backup.exists() or backup.is_symlink():
+                raise AppearanceError("Could not reserve a wallpaper browser cache backup")
+
+            try:
+                try:
+                    previous_mtime = int(stage.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    previous_mtime = 0
+                temporary.mkdir(mode=0o700)
+                temporary_created = True
+                for item in manifest["items"]:
+                    (temporary / item["stage"]).symlink_to(item["path"])
+                (temporary / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=True, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                # omarchy-menu-images intentionally uses whole-second
+                # directory mtimes as its fast cache signature. Guarantee a
+                # changed generation has a different value even when two pool
+                # updates happen in the same second.
+                generation_mtime = max(int(time.time()), previous_mtime + 1)
+                os.utime(temporary, (generation_mtime, generation_mtime))
+
+                moved_old = False
+                if stage.exists() or stage.is_symlink():
+                    os.replace(stage, backup)
+                    moved_old = True
+                try:
+                    os.replace(temporary, stage)
+                except OSError:
+                    if moved_old and not (stage.exists() or stage.is_symlink()):
+                        os.replace(backup, stage)
+                    raise
+                if moved_old:
+                    try:
+                        remove_cache_entry(backup)
+                    except OSError:
+                        pass
+            except OSError as error:
+                raise AppearanceError("Could not stage wallpapers for the browser") from error
+            finally:
+                if temporary_created and (temporary.exists() or temporary.is_symlink()):
+                    remove_cache_entry(temporary)
+        return stage, manifest
+    finally:
+        # os.fdopen owns the descriptor once entered; close it here only if
+        # setup failed before the context manager could take ownership.
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def single_selected_line(output: str, chooser: str) -> str:
+    if output == "":
+        return ""
+    lines = output.splitlines()
+    if len(lines) != 1 or not lines[0]:
+        raise AppearanceError(f"{chooser} returned an invalid selection")
+    return lines[0]
+
+
+def run_choice(arguments: list[str], chooser: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            arguments,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise AppearanceError(f"Could not open the {chooser.lower()}") from error
+
+
+def selected_picker_record(
+    stage: Path,
+    expected_manifest: dict[str, Any],
+    selected: str,
+) -> dict[str, Any]:
+    selected_path = Path(selected)
+    if not selected_path.is_absolute() or selected_path.parent != stage:
+        raise AppearanceError("Wallpaper browser returned a path outside its staged pool")
+    if read_json(stage / "manifest.json") != expected_manifest:
+        raise AppearanceError("Wallpaper pool changed while the browser was open; please choose again")
+
+    items = expected_manifest.get("items")
+    record = next(
+        (
+            item
+            for item in items
+            if isinstance(item, dict) and item.get("stage") == selected_path.name
+        ),
+        None,
+    ) if isinstance(items, list) else None
+    if record is None:
+        raise AppearanceError("Wallpaper browser returned an unknown selection")
+
+    target = resolved_image(str(record.get("path") or ""))
+    try:
+        link_target = selected_path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise AppearanceError("Selected wallpaper is no longer available") from error
+    if not selected_path.is_symlink() or target is None or link_target != target:
+        raise AppearanceError("Selected wallpaper no longer matches the staged pool")
+    if target_signature(target) != record.get("signature"):
+        raise AppearanceError("Selected wallpaper changed while the browser was open; please choose again")
+    return record
+
+
+def browse_wallpapers(scope: str) -> dict[str, Any]:
+    slug = current_theme()
+    if not slug:
+        raise AppearanceError("Could not determine the current theme")
+    inventory = ThemeInventory()
+    mode = active_theme_appearance()[1] or inventory.mode(slug)[0]
+    inventory.use_active_mode(slug, mode)
+    active_pool = inventory.wallpapers(slug)
+    records = active_pool if scope == "theme" else inventory.mode_wallpapers(mode)
+    if not records:
+        label = "active theme" if scope == "theme" else f"{mode} themes"
+        raise AppearanceError(f"No wallpapers found for {label}")
+
+    stage, manifest = stage_wallpaper_pool(scope, slug, mode, records)
+    current = stable_current_background(slug, active_pool)
+    current_path = resolved_image(current)
+    result = run_choice(
+        [
+            "omarchy",
+            "menu",
+            "images",
+            "--selected",
+            str(current_path) if current_path is not None else "",
+            "--show-labels",
+            "--filterable",
+            "--lazy-thumbnails",
+            str(stage),
+        ],
+        "wallpaper browser",
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "Wallpaper browser failed"
+        raise AppearanceError(detail)
+
+    selected = single_selected_line(result.stdout, "Wallpaper browser")
+    if not selected:
+        return {"version": 1, "selected": False}
+    record = selected_picker_record(stage, manifest, selected)
+    return {
+        "version": 1,
+        "selected": True,
+        "scope": scope,
+        "path": record["path"],
+        "name": record["name"],
+        "theme": record["theme"],
+    }
+
+
+def validate_personal_wallpaper(path: str) -> Path:
+    selected = resolved_image(path)
+    if selected is None or not os.access(selected, os.R_OK):
+        raise AppearanceError("Choose a readable JPG, PNG, GIF, BMP, or WebP image")
+    return selected
+
+
+def same_file_contents(left: Path, right: Path) -> bool:
+    try:
+        if right.is_symlink() or not right.is_file() or left.stat().st_size != right.stat().st_size:
+            return False
+        with left.open("rb") as left_handle, right.open("rb") as right_handle:
+            while True:
+                left_chunk = left_handle.read(1024 * 1024)
+                right_chunk = right_handle.read(1024 * 1024)
+                if left_chunk != right_chunk:
+                    return False
+                if not left_chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def import_candidate_name(source: Path, number: int) -> str:
+    suffix = source.suffix.lower()
+    addition = "" if number == 1 else f" ({number})"
+    maximum = max(1, 240 - len((addition + suffix).encode("utf-8")))
+    stem = truncate_utf8(source.stem, maximum) or "wallpaper"
+    return f"{stem}{addition}{suffix}"
+
+
+def copy_to_temporary(source: Path, temporary: Path) -> None:
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        os.close(descriptor)
+    except OSError as error:
+        raise AppearanceError("Could not reserve a temporary wallpaper file") from error
+
+    try:
+        try:
+            result = subprocess.run(
+                [
+                    "cp",
+                    "--reflink=auto",
+                    "--preserve=mode,timestamps",
+                    "--",
+                    str(source),
+                    str(temporary),
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            result = None
+        if result is None or result.returncode != 0:
+            with source.open("rb") as source_handle, temporary.open("wb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle, 1024 * 1024)
+            shutil.copystat(source, temporary, follow_symlinks=True)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise AppearanceError("Could not copy the selected wallpaper") from error
+
+
+def import_personal_wallpaper(source: Path, slug: str) -> tuple[Path, bool]:
+    if slug not in theme_slugs():
+        raise AppearanceError(f"Unknown Omarchy theme: {slug}")
+    destination = USER_BACKGROUNDS / slug
+    ensure_not_system_path(destination, "Wallpaper destination")
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        destination = destination.resolve(strict=True)
+    except OSError as error:
+        raise AppearanceError(f"Could not prepare wallpapers for {display_name(slug)}") from error
+    if not destination.is_dir():
+        raise AppearanceError(f"Wallpaper destination for {display_name(slug)} is not a directory")
+    ensure_not_system_path(destination, "Wallpaper destination")
+
+    if source.parent == destination:
+        return source, False
+
+    next_number = 1
+    for number in range(1, 10001):
+        candidate = destination / import_candidate_name(source, number)
+        if not os.path.lexists(candidate):
+            next_number = number
+            break
+        if same_file_contents(source, candidate):
+            return candidate.resolve(strict=True), False
+    else:
+        raise AppearanceError("Could not find an available filename for the selected wallpaper")
+
+    temporary = destination / f".appearance-import-{os.getpid()}-{secrets.token_hex(6)}{source.suffix.lower()}"
+    copy_to_temporary(source, temporary)
+    try:
+        for number in range(next_number, 10001):
+            candidate = destination / import_candidate_name(source, number)
+            if os.path.lexists(candidate):
+                if same_file_contents(source, candidate):
+                    return candidate.resolve(strict=True), False
+                continue
+            try:
+                os.link(temporary, candidate)
+            except FileExistsError:
+                continue
+            except OSError as error:
+                if error.errno == errno.EEXIST:
+                    continue
+                raise AppearanceError("Could not publish the selected wallpaper") from error
+            return candidate.resolve(strict=True), True
+        raise AppearanceError("Could not find an available filename for the selected wallpaper")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def pick_personal_wallpaper(slug: str, import_file: bool) -> dict[str, Any]:
+    if slug not in theme_slugs():
+        raise AppearanceError(f"Unknown Omarchy theme: {slug}")
+    result = run_choice(
+        [
+            "omarchy",
+            "file",
+            "select",
+            "--title",
+            "Choose wallpaper",
+            "--extensions",
+            "jpg jpeg png gif bmp webp",
+        ],
+        "file chooser",
+    )
+    if result.returncode == 1:
+        return {"version": 1, "selected": False}
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "File chooser failed"
+        raise AppearanceError(detail)
+
+    chosen = single_selected_line(result.stdout, "File chooser")
+    if not chosen:
+        return {"version": 1, "selected": False}
+    source = validate_personal_wallpaper(chosen)
+    copied = False
+    final = source
+    if import_file:
+        final, copied = import_personal_wallpaper(source, slug)
+    return {
+        "version": 1,
+        "selected": True,
+        "path": str(final),
+        "name": wallpaper_name(str(final)),
+        "theme": slug,
+        "imported": import_file,
+        "copied": copied,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    status = subparsers.add_parser("status", help="Print current theme, mode, and wallpaper inventory as JSON")
+    status.add_argument(
+        "--background-override",
+        help="Preview status with this wallpaper without changing desktop state",
+    )
+
+    cycle = subparsers.add_parser("cycle", help="Cycle a wallpaper pool")
+    cycle.add_argument("--scope", choices=("theme", "mode"), default="theme")
+    cycle.add_argument("--direction", choices=("next", "previous", "random"), default="next")
+    cycle.add_argument("--dry-run", action="store_true")
+    cycle.add_argument("--request-id", default="")
+
+    set_background = subparsers.add_parser("set-wallpaper", help="Set and verify a wallpaper")
+    set_background.add_argument("path")
+    set_background.add_argument("--request-id", default="")
+
+    browse = subparsers.add_parser("browse", help="Choose from the exact active wallpaper pool")
+    browse.add_argument("--scope", choices=("theme", "mode"), default="theme")
+
+    pick_file = subparsers.add_parser("pick-file", help="Choose a personal wallpaper")
+    pick_file.add_argument("--theme", required=True)
+    pick_file.add_argument(
+        "--import",
+        action="store_true",
+        dest="import_file",
+        help="Copy the selected image into the current theme's user backgrounds",
+    )
+
+    switch = subparsers.add_parser(
+        "switch-theme", help="Apply a theme and remembered wallpaper without a double transition"
+    )
+    switch.add_argument("--theme", required=True)
+    switch.add_argument("--background", default="")
+    switch.add_argument("--request-id", default="")
+
+    solar = subparsers.add_parser("solar", help="Print sunrise and sunset boundaries as JSON")
+    solar.add_argument("--refresh", action="store_true", help="Bypass the six-hour solar cache")
+    return parser.parse_args()
+
+
+def main() -> int:
+    global MUTATION_DEADLINE
+    args = parse_args()
+    mutation = args.command in {"switch-theme", "set-wallpaper", "cycle"} and not getattr(args, "dry_run", False)
+    if mutation:
+        MUTATION_DEADLINE = time.monotonic() + COMMAND_TIMEOUT_SECONDS
+    try:
+        if args.command == "status":
+            override = validate_personal_wallpaper(args.background_override) if args.background_override else None
+            payload = build_status(background_override=override)
+        elif args.command == "solar":
+            payload = solar_schedule(args.refresh)
+        elif args.command == "switch-theme":
+            payload = switch_theme(args.theme, args.background, args.request_id)
+        elif args.command == "set-wallpaper":
+            payload = set_wallpaper(args.path)
+        elif args.command == "cycle":
+            payload = cycle_wallpaper(args.scope, args.direction, args.dry_run)
+        elif args.command == "browse":
+            payload = browse_wallpapers(args.scope)
+        else:
+            payload = pick_personal_wallpaper(args.theme, args.import_file)
+        if mutation:
+            MUTATION_DEADLINE = None
+            payload.update({"version": 1, "ok": True, "status": build_status(), "requestId": args.request_id})
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+        return 0
+    except AppearanceError as error:
+        if mutation:
+            emit_mutation_error(error, args.request_id)
+        print(f"appearance-helper: {error}", file=sys.stderr)
+        return 2
+    except Exception as error:  # Keep the QML service alive on malformed third-party themes.
+        if mutation:
+            emit_mutation_error(error, args.request_id)
+        print(f"appearance-helper: {error}", file=sys.stderr)
+        return 1
+    finally:
+        MUTATION_DEADLINE = None
+
+
+def emit_mutation_error(error: Exception, request_id: str) -> None:
+    global MUTATION_DEADLINE
+    MUTATION_DEADLINE = None
+    try:
+        status = build_status()
+    except Exception:
+        status = None
+    print(json.dumps({
+        "version": 1, "ok": False, "error": str(error),
+        "status": status, "requestId": request_id,
+    }, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
