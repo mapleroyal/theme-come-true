@@ -4,7 +4,7 @@
   "name": "Theme Come True",
   "version": "1.0.0",
   "author": "mapleroyal",
-  "description": "Introducing a top bar menu for easily switching between dark/light mode, themes, and wallpapers. **Built, optimized, and reviewed with GPT 6 Astra Ultra.**",
+  "description": "Introducing a top bar menu for easily switching between dark/light mode, themes, and wallpapers. Built, optimized, and reviewed by GPT 6 Astra Ultra.",
   "kinds": [
     "service",
     "bar-widget"
