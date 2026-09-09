@@ -101,9 +101,12 @@ Item {
 
   function settingsFromShell() {
     var config = root.shell ? root.shell.shellConfig : null
-    if (!config) return ({})
+    // Omarchy 4.0.3 gives custom services a scoped shell API. Its barConfig
+    // still includes our inline settings and updates when they are saved.
+    var barConfig = root.shell && root.shell.barConfig
+      ? root.shell.barConfig : (config && config.bar ? config.bar : null)
 
-    var layout = config.bar && config.bar.layout ? config.bar.layout : null
+    var layout = barConfig && barConfig.layout ? barConfig.layout : null
     var sections = ["left", "center", "right"]
     if (layout) {
       for (var s = 0; s < sections.length; s++) {
@@ -115,7 +118,7 @@ Item {
       }
     }
 
-    var plugins = config.plugins || []
+    var plugins = config && config.plugins ? config.plugins : []
     for (var p = 0; p < plugins.length; p++) {
       if (plugins[p] && String(plugins[p].id || "") === root.pluginId)
         return plugins[p]

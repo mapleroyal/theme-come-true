@@ -91,6 +91,11 @@ shuffle bags are bounded session state and intentionally reset on reload.
 Wallpaper scope affects browsing/cycling; mode changes restore the last mode
 wallpaper, and same-mode theme changes restore that theme's pool wallpaper.
 
+Omarchy 4.0.3 exposes a scoped shell facade to custom plugins. Read the plugin's
+inline bar entry from its reactive `barConfig` snapshot, with `shellConfig` as a
+fallback for older hosts. Settings writes replace the entry, so merge patches
+with that current entry to preserve unrelated preferences and remembered paths.
+
 The picker cache presents an exact merged pool to Omarchy's directory-based
 image picker. It uses owned directories, a lock, atomic publication, source
 signatures and selection validation. Personal imports preserve the original,
@@ -108,11 +113,15 @@ python3 -B -m unittest discover -s tests -p 'test_*.py'
 node --test tests/*.test.mjs
 python3 -B tests/run-ui-test.py
 python3 -B tests/run-service-test.py
+python3 -B tests/run-settings-test.py
 ```
 
 Python tests use temporary fixtures, and the QML tests run offscreen. Node.js
 is needed only for development tests. The native transition adapter is tested
 against Omarchy 4.0.2-1 and Quickshell 0.3.1-1.
+The settings regression uses Omarchy 4.0.3's actual scoped facade and a legacy
+shell fixture to check saved scope, toggling, reactive updates and preservation
+of theme pairs, schedules, remembered wallpapers and additional settings.
 
 Model tests cover time/solar boundaries, manual
 overrides, DST, ordered/random navigation, removed choices and bounded history.
