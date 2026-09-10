@@ -50,8 +50,8 @@ function inventory(theme = 'a', background = `/${theme}.png`, mode = 'dark') {
   };
 }
 
-function harness() {
-  const events = [], later = [], writes = [];
+function harness(options = {}) {
+  const events = [], later = [], writes = [], settingsPublications = [];
   let now = Date.now();
   class FakeDate extends Date {
     constructor(...args) { super(...(args.length ? args : [now])); }
@@ -70,7 +70,7 @@ function harness() {
     solarEvents: [], solarLoadedAt: 0, solarLastAttemptAt: 0, solarLocation: '', solarLocationSource: '',
     clockNow: now, lightRandomBackHistory: [], darkRandomBackHistory: [],
     lightRandomHistoryTip: '', darkRandomHistoryTip: '', lightRandomBag: [], darkRandomBag: [],
-    wallpaperRandomHistories: {}, wallpaperRandomTips: {},
+    wallpaperRandomHistories: {}, wallpaperRandomTips: {}, pendingSettings: {},
   };
   let snapshot = inventory();
   Object.defineProperty(root, 'snapshot', { get: () => snapshot, set: value => {
@@ -80,7 +80,8 @@ function harness() {
     busy: () => root.operation !== null, current: () => root.snapshot.current || {},
     currentTheme: () => root.current.theme || '', currentMode: () => root.current.mode || 'dark',
     currentBackground: () => root.current.background || '', currentInThemePool: () => root.current.inThemePool === true,
-    themes: () => root.snapshot.themes || [], settings: () => root.settingsFromShell(),
+    themes: () => root.snapshot.themes || [], settings: () => root.effectiveSettings(),
+    publishedSettings: () => root.settingsFromShell(),
     rememberedWallpapers: () => root.settings.rememberedWallpapers || {},
     wallpaperScope: () => root.settings.wallpaperScope || 'theme',
     lightThemeOptions: () => root.optionsForMode('light'), darkThemeOptions: () => root.optionsForMode('dark'),
@@ -99,7 +100,12 @@ function harness() {
     shellConfig: { bar: { layout: { left: [], center: [], right: [{ id: root.pluginId, darkTheme: 'a' }] } } },
     updateEntryInline(id, value) {
       writes.push(plain(value));
-      this.shellConfig.bar.layout.right = [plain(value)];
+      const publish = () => {
+        this.shellConfig.bar.layout.right = [plain(value)];
+        root.acknowledgeSettings();
+      };
+      if (options.deferSettings) settingsPublications.push(publish);
+      else publish();
       events.push(['settings', root.currentBackground, root.busy]);
       return true;
     },
@@ -120,6 +126,7 @@ function harness() {
   });
   for (const fn of functions(source)) root[fn.name] = vm.runInContext(`(${fn.text})`, context);
   return { root, context, events, writes, later,
+    publishSettings() { while (settingsPublications.length) settingsPublications.shift()(); },
     setNow(value) { now = value; root.clockNow = value; },
     reveal(next = root.preparedSnapshot || root.snapshot) {
       root.themeRenderSerial += 1;
@@ -188,6 +195,73 @@ test('theme settings and random history persist only after a successful verified
   assert.deepEqual(plain(root.darkRandomBackHistory), ['a']);
   assert.equal(root.lastError, 'fixture failure');
   assert.equal(root.busy, false);
+});
+
+test('theme completion preserves its selected dropdown value when settings publication is delayed', () => {
+  const h = harness({ deferSettings: true }), { root } = h;
+  assert.equal(root.chooseTheme('dark', 'b'), true);
+  h.publishSettings(); // The starting wallpaper is saved while the helper runs.
+  complete(h, inventory('b', '/chosen-b.png'));
+  h.publishSettings();
+  assert.equal(root.settings.darkTheme, 'b');
+  assert.equal(root.rememberedWallpapers['theme:b'], '/chosen-b.png');
+  assert.equal(root.rememberedWallpapers['theme:a'], '/a.png');
+});
+
+test('unacknowledged fields survive later probes and writes while unrelated external settings remain live', () => {
+  const h = harness({ deferSettings: true }), { root } = h;
+  root.chooseTheme('dark', 'b');
+  complete(h, inventory('b', '/chosen-b.png'));
+  assert.equal(root.darkTheme, 'b');
+  const count = h.writes.length;
+  root.statusGeneration = root.stateGeneration;
+  root.consumeStatus(JSON.stringify(inventory('b', '/chosen-b.png')));
+  assert.equal(h.writes.length, count, 'a later probe must not rewrite stale scoped settings');
+  root.shell.shellConfig.bar.layout.right[0].customFutureSetting = 'external';
+  root.updateSettings({ wallpaperScope: 'mode' });
+  assert.equal(h.writes.at(-1).darkTheme, 'b');
+  assert.equal(h.writes.at(-1).customFutureSetting, 'external');
+  h.publishSettings();
+  assert.deepEqual(plain(root.pendingSettings), {});
+  root.shell.shellConfig.bar.layout.right[0].darkTheme = 'c';
+  assert.equal(root.darkTheme, 'c', 'acknowledged fields resume following external preferences');
+});
+
+test('a denied settings write does not leave an optimistic preference behind', () => {
+  const h = harness(), { root } = h;
+  root.shell.updateEntryInline = () => false;
+  assert.equal(root.updateSettings({ darkTheme: 'b' }), false);
+  assert.equal(root.darkTheme, 'a');
+  assert.deepEqual(plain(root.pendingSettings), {});
+});
+
+test('an already-identical host write preserves the preceding unacknowledged fields', () => {
+  const h = harness({ deferSettings: true }), { root } = h;
+  root.updateSettings({ darkTheme: 'b' });
+  root.shell.updateEntryInline = () => false;
+  assert.equal(root.updateSettings({ darkTheme: 'b' }), false);
+  assert.equal(root.darkTheme, 'b');
+  assert.deepEqual(plain(root.pendingSettings), { darkTheme: 'b' });
+  h.publishSettings();
+  assert.deepEqual(plain(root.pendingSettings), {});
+});
+
+test('a wallpaper chosen from another theme or a personal file follows the active theme on return', () => {
+  for (const background of ['/other-theme/image.png', '/personal/photo.png']) {
+    const h = harness(), { root } = h;
+    root.shell.shellConfig.bar.layout.right[0].wallpaperScope = 'mode';
+    root.startWallpaperAction('Select', ['/fixture/helper'], 'select', background);
+    const selected = inventory('a', background);
+    selected.current.inThemePool = false;
+    selected.current.inModePool = background.startsWith('/other-theme/');
+    complete(h, selected);
+    assert.equal(root.rememberedWallpapers['theme:a'], background);
+    root.chooseTheme('dark', 'b');
+    complete(h, inventory('b'));
+    root.chooseTheme('dark', 'a');
+    assert.deepEqual(plain(h.context.actionProcess.command).slice(0, 6),
+      ['/fixture/helper', 'switch-theme', '--theme', 'a', '--background', background]);
+  }
 });
 
 test('successful exit with a wrong theme is not accepted as a completed request', () => {

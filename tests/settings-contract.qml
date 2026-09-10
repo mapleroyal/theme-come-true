@@ -19,19 +19,27 @@ ShellRoot {
     customFutureSetting: {enabled: true, value: 17}
   })
   property var config: ({bar: {layout: {left: [], center: [], right: [initialEntry]}}})
+  property var publishedConfig: ({bar: {layout: {left: [], center: [], right: [initialEntry]}}})
 
   function persist(id, entry) {
     if (id !== root.pluginId) throw new Error("Attempt to update another plugin")
     var copy = JSON.parse(JSON.stringify(root.config))
     copy.bar.layout.right = [entry]
     root.config = copy
+    if (root.apiMode === "scoped-delayed") publication.restart()
     return true
+  }
+
+  Timer {
+    id: publication
+    interval: 5
+    onTriggered: root.publishedConfig = JSON.parse(JSON.stringify(root.config))
   }
 
   Fixture.HostShellApi {
     id: scopedApi
     pluginId: root.pluginId
-    barConfig: root.config.bar
+    barConfig: root.apiMode === "scoped-delayed" ? root.publishedConfig.bar : root.config.bar
     _updateSettings: function(id, entry) { return root.persist(id, entry) }
   }
 
@@ -92,8 +100,25 @@ ShellRoot {
         copy.bar.layout.right[0].wallpaperScope = "theme"
         root.config = copy
       } else if (root.step === 3) {
+        if (root.apiMode === "scoped-delayed") root.publishedConfig = root.config
         root.equal(service.wallpaperScope, "theme", "external settings refresh is reactive")
         root.preserved("external refresh")
+        service.updateSettings({darkTheme: "a"})
+      } else if (root.step === 4) {
+        var next = JSON.parse(JSON.stringify(service.snapshot))
+        next.current.theme = "b"
+        next.current.background = "/other-theme/chosen.png"
+        next.current.inThemePool = false
+        service.operation = {kind: "theme", mode: "dark", theme: "b", pairMode: "dark"}
+        service.applySnapshot(next)
+        service.finishAction(true)
+      } else if (root.step === 5) {
+        root.equal(service.configuredDarkTheme, "b", "completion keeps accepted dropdown selection")
+        root.equal(root.config.bar.layout.right[0].darkTheme, "b", "completion persists accepted theme")
+        root.equal(service.rememberedThemeWallpaper("b"), "/other-theme/chosen.png",
+                   "completion remembers image from another theme")
+        root.equal(service.settings.customFutureSetting, root.initialEntry.customFutureSetting,
+                   "completion preserves unrelated preferences")
         console.log("settings-regression:", root.failures === 0 ? "PASS" : "FAIL",
                     root.apiMode, root.checks + " checks", root.failures + " failures")
         Qt.quit()

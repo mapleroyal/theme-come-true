@@ -89,12 +89,21 @@ The shell's inline-settings API persists theme pairs, schedule choices, manual
 override deadlines and remembered wallpaper paths. Random/back history and
 shuffle bags are bounded session state and intentionally reset on reload.
 Wallpaper scope affects browsing/cycling; mode changes restore the last mode
-wallpaper, and same-mode theme changes restore that theme's pool wallpaper.
+wallpaper, and same-mode theme changes restore that theme's selected wallpaper,
+including personal images and selections browsed from another theme's pool.
 
 Omarchy 4.0.3 exposes a scoped shell facade to custom plugins. Read the plugin's
 inline bar entry from its reactive `barConfig` snapshot, with `shellConfig` as a
 fallback for older hosts. Settings writes replace the entry, so merge patches
 with that current entry to preserve unrelated preferences and remembered paths.
+The host's synchronous `shellConfig` signal can publish the preceding derived
+`barConfig` to its scoped facade. Later probes can arrive before it observes the
+saved entry. Commit an operation's theme/schedule preferences and wallpaper
+memory in one entry write. Keep successfully written fields as a pending overlay
+until the facade observes them, so a later inventory probe or settings change
+cannot merge the preceding theme back into storage. Unrelated external fields
+remain live; acknowledged fields resume following the facade, and rejected
+writes do not retain an optimistic preference.
 
 The picker cache presents an exact merged pool to Omarchy's directory-based
 image picker. It uses owned directories, a lock, atomic publication, source
@@ -119,9 +128,11 @@ python3 -B tests/run-settings-test.py
 Python tests use temporary fixtures, and the QML tests run offscreen. Node.js
 is needed only for development tests. The native transition adapter is tested
 against Omarchy 4.0.2-1 and Quickshell 0.3.1-1.
-The settings regression uses Omarchy 4.0.3's actual scoped facade and a legacy
-shell fixture to check saved scope, toggling, reactive updates and preservation
-of theme pairs, schedules, remembered wallpapers and additional settings.
+The settings regression uses Omarchy 4.0.3's actual scoped facade, its exact
+synchronous host notification order, delayed publication and a legacy shell
+fixture to check follow-up probes before acknowledgement, saved scope,
+rejected writes, reactive updates and preservation of
+theme pairs, schedules, remembered wallpapers and additional settings.
 
 Model tests cover time/solar boundaries, manual
 overrides, DST, ordered/random navigation, removed choices and bounded history.

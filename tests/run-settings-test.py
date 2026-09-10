@@ -17,7 +17,7 @@ FACADE = PACKAGED / "services/PluginShellApi.qml"
 if not shutil.which("quickshell") or not FACADE.is_file():
     raise SystemExit("The settings test requires QuickShell and Omarchy's scoped plugin API")
 
-for api_mode in ("scoped", "legacy"):
+for api_mode in ("scoped", "scoped-delayed", "host-order", "legacy"):
     with tempfile.TemporaryDirectory(prefix="appearance-settings-test-") as temporary:
         config = Path(temporary)
         fixture_home = config / "fixture-home"
@@ -34,7 +34,8 @@ for api_mode in ("scoped", "legacy"):
             'readonly property string home: String(Quickshell.env("APPEARANCE_TEST_HOME") || "")')
         (config / "TestService.qml").write_text(source)
         shutil.copyfile(FACADE, config / "HostShellApi.qml")
-        shutil.copyfile(ROOT / "tests/settings-contract.qml", config / "shell.qml")
+        contract = "host-order-contract.qml" if api_mode == "host-order" else "settings-contract.qml"
+        shutil.copyfile(ROOT / "tests" / contract, config / "shell.qml")
         helper = config / "appearance-helper"
         shutil.copyfile(ROOT / "tests/fake-helper.py", helper)
         helper.chmod(0o755)

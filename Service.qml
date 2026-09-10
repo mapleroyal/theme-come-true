@@ -126,7 +126,13 @@ Item {
     return ({})
   }
 
-  readonly property var settings: root.settingsFromShell()
+  // The host may publish the preceding entry during a successful write. A
+  // later probe can arrive before the scoped API observes the saved fields.
+  // Keep those fields pending; unrelated externally edited fields stay live.
+  property var pendingSettings: ({})
+  readonly property var publishedSettings: root.settingsFromShell()
+  onPublishedSettingsChanged: root.acknowledgeSettings()
+  readonly property var settings: root.effectiveSettings()
   readonly property string configuredLightTheme: String(settings.lightTheme || "catppuccin-latte")
   readonly property string configuredDarkTheme: String(settings.darkTheme || "catppuccin")
   readonly property string wallpaperScope: String(settings.wallpaperScope || "theme") === "mode" ? "mode" : "theme"
@@ -291,12 +297,31 @@ Item {
     return mode === "light" ? root.lightTheme : root.darkTheme
   }
 
+  function effectiveSettings() {
+    return Object.assign({}, root.settingsFromShell(), root.pendingSettings)
+  }
+
+  function acknowledgeSettings() {
+    var pending = Object.assign({}, root.pendingSettings)
+    var changed = false
+    for (var key in pending) {
+      if (JSON.stringify(root.publishedSettings[key]) === JSON.stringify(pending[key])) {
+        delete pending[key]
+        changed = true
+      }
+    }
+    if (changed) root.pendingSettings = pending
+  }
+
   function updateSettings(patch) {
     if (!root.shell || typeof root.shell.updateEntryInline !== "function") return false
-    var next = { id: root.pluginId }
-    for (var key in root.settings) if (key !== "id") next[key] = root.settings[key]
-    for (var changed in patch) next[changed] = patch[changed]
-    return root.shell.updateEntryInline(root.pluginId, next)
+    var next = Object.assign({}, root.effectiveSettings(), patch, { id: root.pluginId })
+    var previous = root.pendingSettings
+    root.pendingSettings = Object.assign({}, previous, patch)
+    var changed = root.shell.updateEntryInline(root.pluginId, next)
+    if (!changed) root.pendingSettings = previous
+    root.acknowledgeSettings()
+    return changed
   }
 
   function randomHistoryForMode(mode) {
@@ -645,24 +670,29 @@ Item {
     return String(root.rememberedWallpapers["theme:" + theme] || "")
   }
 
-  function rememberCurrentWallpaper() {
-    if (!root.ready || root.busy || root.currentBackground === "") return
-    var next = {}
-    for (var key in root.rememberedWallpapers) next[key] = root.rememberedWallpapers[key]
-    var changed = false
-    var modeKey = "mode:" + root.currentMode
-    if (next[modeKey] !== root.currentBackground) {
-      next[modeKey] = root.currentBackground
-      changed = true
-    }
-    if (root.currentInThemePool && root.currentTheme !== "") {
-      var themeKey = "theme:" + root.currentTheme
-      if (next[themeKey] !== root.currentBackground) {
-        next[themeKey] = root.currentBackground
+  function rememberCurrentWallpaper(settingsPatch) {
+    var patch = Object.assign({}, settingsPatch || ({}))
+    if (root.ready && !root.busy && root.currentBackground !== "") {
+      var next = {}
+      for (var key in root.rememberedWallpapers) next[key] = root.rememberedWallpapers[key]
+      var changed = false
+      var modeKey = "mode:" + root.currentMode
+      if (next[modeKey] !== root.currentBackground) {
+        next[modeKey] = root.currentBackground
         changed = true
       }
+      // Browsing scope chooses the available images, not which selections
+      // belong to this theme. Remember cross-theme and personal images too.
+      if (root.currentTheme !== "") {
+        var themeKey = "theme:" + root.currentTheme
+        if (next[themeKey] !== root.currentBackground) {
+          next[themeKey] = root.currentBackground
+          changed = true
+        }
+      }
+      if (changed) patch.rememberedWallpapers = next
     }
-    if (changed) root.updateSettings({ rememberedWallpapers: next })
+    if (Object.keys(patch).length) root.updateSettings(patch)
   }
 
   function requestMode(mode, manual) {
@@ -818,6 +848,7 @@ Item {
   function finishAction(success) {
     var op = root.operation
     if (!op) return
+    var patch = {}
     if (op.scheduled) {
       if (success) root.resetScheduleRetry()
       else {
@@ -830,13 +861,12 @@ Item {
       }
     }
     if (success) {
-      var patch = Object.assign({}, op.settingsPatch || ({}))
+      patch = Object.assign({}, op.settingsPatch || ({}))
       if (op.kind === "theme") {
         root.commitPendingNavigation()
         if (op.pairMode === "light") patch.lightTheme = op.theme
         if (op.pairMode === "dark") patch.darkTheme = op.theme
       } else if (op.kind === "wallpaper") root.commitPendingWallpaperNavigation()
-      if (Object.keys(patch).length) root.updateSettings(patch)
     } else if (op.kind === "wallpaper" && op.navigationKind === "history-back") {
       root.clearWallpaperRandomHistory(op.poolKey)
     }
@@ -847,7 +877,9 @@ Item {
     root.operation = null
     root.actionStatus = ""
     root.stateGeneration += 1
-    root.rememberCurrentWallpaper()
+    // The scoped barConfig can lag during the host's shellConfig signal.
+    // A second full-entry write here could restore the preceding theme.
+    root.rememberCurrentWallpaper(patch)
     // The adapter's final snapshot already includes its own filesystem events.
     // A fresh background probe is reserved for an explicitly queued refresh.
     root.refreshQueued = false
@@ -1287,6 +1319,8 @@ Item {
         visualCommitted: root.operation ? root.operation.visualCommitted === true : false,
         mode: root.currentMode,
         theme: root.currentTheme,
+        lightTheme: root.lightTheme,
+        darkTheme: root.darkTheme,
         background: root.currentBackground,
         scope: root.wallpaperScope,
         automatic: root.autoEnabled,
