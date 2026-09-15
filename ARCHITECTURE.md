@@ -24,7 +24,7 @@ visual snapshot can update the view early; it does
 not commit preferences or history. Final verification remains authoritative,
 including when native commands change state and subsequently fail in an app
 hook. Such confirmed changes are reported with warnings. Rejected operations
-do not consume a shuffle bag or save a new theme pair. Scheduled failures retry
+do not consume a shuffle bag or save a new theme. Scheduled failures retry
 after 30 seconds with exponential backoff capped at five minutes; a new schedule
 boundary or changed settings can try immediately. Mode toggles preserve each
 mode's navigation history.
@@ -85,7 +85,7 @@ replace this bridge. Tests cover its exact IPC contract, failures and ownership.
 
 ## Persistence and caches
 
-The shell's inline-settings API persists theme pairs, schedule choices, manual
+The shell's inline-settings API persists themes, schedule choices, manual
 override deadlines and remembered wallpaper paths. Random/back history and
 shuffle bags are bounded session state and intentionally reset on reload.
 Wallpaper scope affects browsing/cycling; mode changes restore the last mode
@@ -132,7 +132,7 @@ The settings regression uses Omarchy 4.0.3's actual scoped facade, its exact
 synchronous host notification order, delayed publication and a legacy shell
 fixture to check follow-up probes before acknowledgement, saved scope,
 rejected writes, reactive updates and preservation of
-theme pairs, schedules, remembered wallpapers and additional settings.
+themes, schedules, remembered wallpapers and additional settings.
 
 Model tests cover time/solar boundaries, manual
 overrides, DST, ordered/random navigation, removed choices and bounded history.

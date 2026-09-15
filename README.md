@@ -2,7 +2,7 @@
 
 A top bar menu for easily switching between dark/light mode, themes, and wallpapers. Built, optimized, and reviewed by GPT 6 Astra Ultra.
 
-![Theme Come True with Solitude – On Pole](preview.png)
+![Theme Come True with Matte Black – Ship At Sea](preview.png)
 
 ## Features
 
@@ -34,7 +34,7 @@ Click the sun/moon icon to open the menu. Right-click it to toggle light/dark
 mode; middle-click it to advance the wallpaper. Click the wallpaper preview
 to open Omarchy's fullscreen image picker.
 
-Theme pairs, schedules, and remembered wallpapers survive shell reloads.
+Themes, schedules, and remembered wallpapers survive shell reloads.
 Previous/random history lasts for the current shell session.
 
 For keyboard shortcuts, open the menu on the focused monitor with
@@ -56,7 +56,7 @@ Your current theme, wallpapers, and imported personal images remain in place.
 ## License
 
 Plugin code is [MIT licensed](LICENSE). Bundled MingCute icons retain their
-Apache-2.0 license; the screenshot shows Omarchy’s Solitude theme and On Pole
+Apache-2.0 license; the screenshot shows Omarchy’s Matte Black theme and Ship At Sea
 wallpaper, which are not covered by the plugin’s MIT license.
 
 ## Artwork

@@ -377,7 +377,7 @@ Panel {
           PanelSeparator { foreground: root.foreground }
 
           PanelSectionHeader {
-            text: "THEME PAIR"
+            text: "THEME"
             foreground: root.foreground
             fontFamily: root.fontFamily
           }
