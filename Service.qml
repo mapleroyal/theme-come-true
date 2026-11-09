@@ -107,7 +107,7 @@ Item {
       ? root.shell.barConfig : (config && config.bar ? config.bar : null)
 
     var layout = barConfig && barConfig.layout ? barConfig.layout : null
-    var sections = ["left", "center", "right"]
+    var sections = ["left", "centerBegin", "center", "centerEnd", "right"]
     if (layout) {
       for (var s = 0; s < sections.length; s++) {
         var entries = layout[sections[s]] || []
